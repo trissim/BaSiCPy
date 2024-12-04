@@ -192,6 +192,8 @@ class BaSiC(BaseModel):
     _smoothness_flatfield: float = PrivateAttr(None)
     _smoothness_darkfield: float = PrivateAttr(None)
     _sparse_cost_darkfield: float = PrivateAttr(None)
+    _flatfield_small: float = PrivateAttr(None)
+    _darkfield_small: float = PrivateAttr(None)
 
     class Config:
         """Pydantic class configuration."""
@@ -339,16 +341,14 @@ class BaSiC(BaseModel):
         Im = self._resize_to_working_size(images)
 
         if fitting_weight is not None:
+            flag_segmentation = True
             Ws = device_put(fitting_weight).astype(jnp.float32)
-            Ws = self._resize_to_working_size(Ws)
-            # normalize relative weight to 0 to 1
-            Ws_min = jnp.min(Ws)
-            Ws_max = jnp.max(Ws)
-            Ws = (Ws - Ws_min) / (Ws_max - Ws_min)
+            Ws = self._resize_to_working_size(Ws) > 0
         else:
+            flag_segmentation = False
             Ws = jnp.ones_like(Im)
 
-        Ws = Ws * self._perform_segmentation(Im)
+        # Ws = Ws * self._perform_segmentation(Im)
 
         # Im2 and Ws2 will possibly be sorted
         if self.sort_intensity:
@@ -359,22 +359,22 @@ class BaSiC(BaseModel):
             Im2 = Im
             Ws2 = Ws
 
-        if self.fitting_mode == FittingMode.approximate:
-            mean_image = jnp.mean(Im2, axis=0)
-            mean_image = mean_image / jnp.mean(Im2)
-            mean_image_dct = JaxDCT.dct3d(mean_image.T)
-            self._smoothness_flatfield = (
-                jnp.sum(jnp.abs(mean_image_dct)) / 800 * self.smoothness_flatfield
-            )
-            self._smoothness_darkfield = (
-                self._smoothness_flatfield * self.smoothness_darkfield / 2.5
-            )
+        if self.smoothness_flatfield is None:
+            meanD = Im.mean(0)
+            meanD = meanD / meanD.mean()
+            W_meanD = JaxDCT.dct3d(meanD, norm="ortho")
+            self._smoothness_flatfield = jnp.sum(jnp.abs(W_meanD)) / (400) * 0.5
+        else:
+            self._smoothness_flatfield = self.smoothness_flatfield
+        if self.smoothness_darkfield is None:
+            self._smoothness_darkfield = self._smoothness_flatfield * 0.2
+        else:
+            self._smoothness_darkfield = self.smoothness_darkfield
+        if self.sparse_cost_darkfield is None:
             self._sparse_cost_darkfield = (
                 self._smoothness_darkfield * self.sparse_cost_darkfield * 100
             )
         else:
-            self._smoothness_flatfield = self.smoothness_flatfield
-            self._smoothness_darkfield = self.smoothness_darkfield
             self._sparse_cost_darkfield = self.sparse_cost_darkfield
 
         logger.debug(f"_smoothness_flatfield set to {self._smoothness_flatfield}")
@@ -405,6 +405,9 @@ class BaSiC(BaseModel):
 
         # Initialize variables
         W = jnp.ones_like(Im2, dtype=jnp.float32) * Ws2
+        if flag_segmentation:
+            W = W.at[Ws2 == 0].set(self.epsilon)
+        W = W * W.size / W.sum()
         W_D = jnp.ones(Im2.shape[1:], dtype=jnp.float32)
         last_S = None
         last_D = None
@@ -430,7 +433,8 @@ class BaSiC(BaseModel):
             else:
                 B = jnp.ones(Im2.shape[0], dtype=jnp.float32)
             I_R = jnp.zeros(Im2.shape, dtype=jnp.float32)
-            S, D_R, D_Z, I_R, B, norm_ratio, converged = fitting_step.fit(
+            I_B = jnp.zeros(Im2.shape, dtype=jnp.float32)
+            S, D_R, D_Z, I_B, I_R, B, norm_ratio, converged = fitting_step.fit(
                 Im2,
                 W,
                 W_D,
@@ -438,8 +442,11 @@ class BaSiC(BaseModel):
                 D_R,
                 D_Z,
                 B,
+                I_B,
                 I_R,
             )
+
+            D_R = D_R + D_Z * S
             logger.debug(f"single-step optimization score: {norm_ratio}.")
             logger.debug(f"mean of S: {float(jnp.mean(S))}.")
             self._score = norm_ratio
@@ -458,12 +465,14 @@ class BaSiC(BaseModel):
             self._D_R = D_R
             self._B = B
             self._D_Z = D_Z
+
             D = fitting_step.calc_darkfield(S, D_R, D_Z)  # darkfield
+            S = I_B.mean(axis=0) - D_R
             mean_S = jnp.mean(S)
             S = S / mean_S  # flatfields
-            B = B * mean_S  # baseline
-            I_B = B[:, newax, newax, newax] * S[newax, ...] + D[newax, ...]
+            # B = B / mean_S  # baseline
             W = fitting_step.calc_weights(I_B, I_R) * Ws2
+            W = W * W.size / W.sum()
             W_D = fitting_step.calc_dark_weights(D_R)
 
             self._weight = W
@@ -525,12 +534,15 @@ class BaSiC(BaseModel):
                 self._weight = W
                 self._residual = I_R
                 logger.debug(f"Iteration {i} finished.")
-
+        self._flatfield_small = S
+        self._darkfield_small = D
         self.flatfield = skimage_resize(S, images.shape[1:])
         self.darkfield = skimage_resize(D, images.shape[1:])
         if ndim == 3:
             self.flatfield = self.flatfield[0]
             self.darkfield = self.darkfield[0]
+            self._flatfield_small = self._flatfield_small[0]
+            self._darkfield_small = self._darkfield_small[0]
         self.baseline = B
         logger.info(
             f"=== BaSiC fit finished in {time.monotonic()-start_time} seconds ==="
@@ -647,6 +659,215 @@ class BaSiC(BaseModel):
         return corrected
 
     def autotune(
+        self,
+        images: np.ndarray,
+        fitting_weight: Optional[np.ndarray] = None,
+        skip_shape_warning: bool = False,
+        optmizer=None,
+        n_iter=100,
+        search_space_flatfield=None,
+        search_space_darkfield=None,
+        init_params=None,
+        timelapse: bool = False,
+        histogram_qmin: float = 0.01,
+        histogram_qmax: float = 0.99,
+        vmin_factor: float = 0.6,
+        vrange_factor: float = 1.5,
+        histogram_bins: int = 1000,
+        histogram_use_fitting_weight: bool = True,
+        fourier_l0_norm_image_threshold: float = 0.1,
+        fourier_l0_norm_fourier_radius=10,
+        fourier_l0_norm_threshold=0.0,
+        fourier_l0_norm_cost_coef=30,
+        early_stop: bool = True,
+        early_stop_n_iter_no_change: int = 15,
+        early_stop_torelance: float = 1e-6,
+        random_state: Optional[int] = None,
+    ) -> None:
+        """Automatically tune the parameters of the model.
+
+        Args:
+            images: input images to fit and correct. See `fit`.
+            fitting_weight: Relative fitting weight for each pixel. See `fit`.
+            skip_shape_warning: if True, warning for last dimension
+                    less than 10 is suppressed.
+            optimizer: optimizer to use. Defaults to
+                    `hyperactive.optimizers.HillClimbingOptimizer`.
+            n_iter: number of iterations for the optimizer. Defaults to 100.
+            search_space: search space for the optimizer.
+                    Defaults to a reasonable range for each parameter.
+            init_params: initial parameters for the optimizer.
+                    Defaults to a reasonable initial value for each parameter.
+            timelapse: if True, corrects the timelapse/photobleaching offsets.
+            histogram_qmin: the minimum quantile to use for the histogram.
+                    Defaults to 0.01.
+            histogram_qmax: the maximum quantile to use for the histogram.
+                    Defaults to 0.99.
+            histogram_bins: the number of bins to use for the histogram.
+                    Defaults to 100.
+            hisogram_use_fitting_weight: if True, uses the weight for the histogram.
+                    Defaults to True.
+            fourier_l0_norm_image_threshold : float
+                The threshold for image values for the fourier L0 norm calculation.
+            fourier_l0_norm_fourier_radius : float
+                The Fourier radius for the fourier L0 norm calculation.
+            fourier_l0_norm_threshold : float
+                The maximum preferred value for the fourier L0 norm.
+            fourier_l0_norm_cost_coef : float
+                The cost coefficient for the fourier L0 norm.
+            early_stop: if True, stops the optimization when the change in
+                    entropy is less than `early_stop_torelance`.
+                    Defaults to True.
+            early_stop_n_iter_no_change: the number of iterations for early
+                    stopping. Defaults to 10.
+            early_stop_torelance: the absolute value torelance
+                    for early stopping.
+            random_state: random state for the optimizer.
+
+        """
+
+        flatfield_pool = np.array(
+            [0.01, 0.1, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5, 6, 7, 8, 10]
+        )
+        flatfield_pool_coarse = np.array([0.01, 0.1, 0.5, 2, 8, 10])
+        second_flag = True
+        if search_space_flatfield is None:
+            pass
+        else:
+            search_space_flatfield = np.asarray(search_space_flatfield)
+            if min(search_space_flatfield) <= 0.01:
+                a = 0
+            else:
+                a = np.where(flatfield_pool < min(search_space_flatfield))[0][-1]
+            if max(search_space_flatfield) >= 10:
+                b = None
+            else:
+                b = np.where(flatfield_pool > max(search_space_flatfield))[0][0] + 1
+            flatfield_pool = flatfield_pool[a:b]
+            flatfield_pool_coarse = flatfield_pool_coarse[
+                (flatfield_pool_coarse >= flatfield_pool.min())
+                * (flatfield_pool_coarse <= flatfield_pool.max())
+            ]
+            flatfield_pool_coarse = np.concatenate(
+                (
+                    np.array([flatfield_pool[0]]),
+                    flatfield_pool_coarse,
+                    np.array([flatfield_pool[-1]]),
+                )
+            )
+            flatfield_pool_coarse = np.unique(flatfield_pool_coarse)
+
+        if init_params is None:
+            init_params = {
+                "smoothness_flatfield": sum(flatfield_pool) / len(flatfield_pool),
+                "get_darkfield": False,
+            }
+            if self.get_darkfield:
+                init_params.update(
+                    {
+                        "smoothness_darkfield": 0,
+                        "sparse_cost_darkfield": 1e-3,
+                    }
+                )
+
+        basic = self.copy(update=init_params)
+        basic.fit(
+            images,
+            fitting_weight=fitting_weight,
+            skip_shape_warning=skip_shape_warning,
+        )
+        transformed = basic.transform(images, timelapse=timelapse)
+
+        vmin, vmax = np.quantile(transformed, [histogram_qmin, histogram_qmax])
+        val_range = (
+            vmax - vmin * vmin_factor
+        ) * vrange_factor  # fix the value range for histogram
+
+        if fitting_weight is None or not histogram_use_fitting_weight:
+            weights = None
+        else:
+            weights = fitting_weight
+
+        def fit_and_calc_entropy(params):
+            try:
+                basic = self.copy(update=params)
+                basic.fit(
+                    images,
+                    fitting_weight=fitting_weight,
+                    skip_shape_warning=skip_shape_warning,
+                )
+                transformed = basic.transform(images, timelapse=timelapse)
+                if np.isnan(transformed).sum():
+                    return np.inf
+                vmin_new = np.quantile(transformed, histogram_qmin) * vmin_factor
+                if np.allclose(basic.flatfield, np.ones_like(basic.flatfield)):
+                    return np.inf  # discard the case where flatfield is all ones
+
+                r = autotune_cost(
+                    transformed,
+                    basic._flatfield_small,
+                    entropy_vmin=vmin_new,
+                    entropy_vmax=vmin_new + val_range,
+                    histogram_bins=histogram_bins,
+                    fourier_l0_norm_cost_coef=fourier_l0_norm_cost_coef,
+                    fourier_l0_norm_image_threshold=fourier_l0_norm_image_threshold,
+                    fourier_l0_norm_fourier_radius=fourier_l0_norm_fourier_radius,
+                    fourier_l0_norm_threshold=fourier_l0_norm_threshold,
+                    weights=weights,
+                )
+
+                return r
+            except RuntimeError:
+                return np.inf
+
+        cost_coarse = []
+        for i in flatfield_pool_coarse:
+            params = {
+                "smoothness_flatfield": i,
+                "smoothness_darkfield": 0,  # 0.1 * i if self.get_darkfield else 0
+                "get_darkfield": False,
+            }
+            a = fit_and_calc_entropy(params)
+            cost_coarse.append(a)
+        cost_coarse = np.stack(cost_coarse)
+        best_ind = np.argmin(cost_coarse)
+        if best_ind == len(cost_coarse) - 1:
+            second_best_ind = best_ind - 1
+        elif best_ind == 0:
+            second_best_ind = 1
+        else:
+            if cost_coarse[best_ind - 1] > cost_coarse[best_ind + 1]:
+                second_best_ind = best_ind - 1
+            else:
+                second_best_ind = best_ind + 1
+        best = flatfield_pool_coarse[best_ind]
+        second_best = flatfield_pool_coarse[second_best_ind]
+        flatfield_pool_narrow = flatfield_pool[
+            (flatfield_pool >= second_best) * (flatfield_pool <= best)
+        ]
+        cost_narrow = np.zeros(len(flatfield_pool_narrow))
+        cost_narrow[0] = cost_coarse[flatfield_pool_narrow[0] == flatfield_pool_coarse][
+            0
+        ]
+        cost_narrow[-1] = cost_coarse[
+            flatfield_pool_narrow[-1] == flatfield_pool_coarse
+        ][0]
+        ind = 1
+        for i in flatfield_pool_narrow[1:-1]:
+            params = {
+                "smoothness_flatfield": i,
+                "smoothness_darkfield": 0,
+            }
+            a = fit_and_calc_entropy(params)
+            cost_narrow[ind] = a
+            ind += 1
+        self.__dict__.update(
+            {"smoothness_flatfield": flatfield_pool_narrow[np.argmin(cost_narrow)]}
+        )
+        print({"smoothness_flatfield": flatfield_pool_narrow[np.argmin(cost_narrow)]})
+        return
+
+    def autotune_hillclimbing(
         self,
         images: np.ndarray,
         fitting_weight: Optional[np.ndarray] = None,
